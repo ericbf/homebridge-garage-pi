@@ -1,0 +1,22 @@
+{
+	"bridge": {
+		"name": "GaragePi Bridge",
+		"username": "CC:22:3D:E3:CE:30",
+		"port": 51826,
+		"pin": "316-52-491"
+	},
+
+	"description": "This homebridge instance runs only the garage door opening accessory.",
+
+	"accessories": [{
+		"accessory": "GaragePi",
+		"name": "Garage Door",
+		"buttonPin": 12,
+		"openSensorPin": 10,
+		"closedSensorPin": 8,
+		"sensorPowerPin": 16,
+		"durationOfMovement": 13000
+	}],
+
+	"platforms": []
+}

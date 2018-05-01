@@ -1,0 +1,38 @@
+{
+	"name": "homebridge-garage-pi",
+	"author": "Eric Ferreira <eferreira1@student.gsu.edu>",
+	"version": "0.0.1",
+	"license": "UNLICENSED",
+	"private": true,
+	"description": "This is the plugin code for my embedded systems project – a raspberry pi garage door opener from scratch.",
+	"main": "build/index.js",
+	"scripts": {
+		"prebuild": "rimraf dist.zip build",
+		"build": "tsc",
+		"postbuild": "zip -r dist build package*"
+	},
+	"dependencies": {
+		"rpio": "^0.9.21"
+	},
+	"devDependencies": {
+		"@types/rpio": "0.0.2",
+		"rimraf": "^2.6.2",
+		"typescript": "^2.8.1",
+		"zip": "^1.2.0"
+	},
+	"engines": {
+		"node": ">=8.0.0",
+		"homebridge": ">=0.4.0"
+	},
+	"keywords": [
+		"homebridge-plugin",
+		"homebridge",
+		"raspberry",
+		"pi",
+		"homekit",
+		"garage",
+		"door",
+		"embedded",
+		"systems"
+	]
+}
