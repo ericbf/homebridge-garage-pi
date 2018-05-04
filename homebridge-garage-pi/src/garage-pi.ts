@@ -30,9 +30,9 @@ type CalculatedState = DoorState.open | DoorState.closed | DoorState.stopped
  */
 export class GaragePi {
 	/**
-	 * The default value for the polling interval. Defaults to `300`.
+	 * The default value for the polling interval. Defaults to `250`.
 	 */
-	static readonly DEFAULT_POLLING_INTERVAL = 300
+	static readonly DEFAULT_POLLING_INTERVAL = 250
 
 	/**
 	 * The default value for the duration to press the garage button. Defaults
@@ -74,7 +74,7 @@ export class GaragePi {
 
 		this._storedState = newValue
 
-		if (oldValue !== undefined) {
+		if (oldValue != undefined) {
 			this.doorState.updateValue(newValue)
 		}
 
@@ -105,7 +105,9 @@ export class GaragePi {
 
 		this._storedTargetState = newValue
 
-		if (oldValue !== undefined) {
+		if (oldValue != undefined) {
+			// Let's try doing this twice to see if it fixes the refresh issue
+			this.doorTargetState.updateValue(newValue)
 			this.doorTargetState.updateValue(newValue)
 		}
 
@@ -113,25 +115,62 @@ export class GaragePi {
 	}
 
 	/**
-	 * This will either be a cancel function for the last wait, or undefined if
-	 *   we are not currently waiting for anything. This resets to the initial
-	 *   value of undefined after the passed duration for movement.
-	 */
-	cancelMovementCompleteCallback: (() => void) | undefined
-
-	/**
 	 * After we programatically press the button, let's wait a few seconds for
 	 *   the door to actually physically react. This will ensure we don't run
 	 *   into a race condition where the door registers as still open/closed
 	 *   because it hasn't started moving yet
 	 */
-	waitingForInitialMovement = false
+	private waitingForInitialMovement = false
 
 	/**
 	 * A queue of the set requests. This prevents button mashing from tripping
 	 *   the system up.
 	 */
-	setQueue: [TargetState, () => void][] = []
+	private requestQueue: [TargetState, () => void][] = []
+
+	/**
+	 * This will either be a cancel function for the last wait, or undefined if
+	 *   we are not currently waiting for anything. This resets to the initial
+	 *   value of undefined after the passed duration for movement.
+	 */
+	private _cancelMovementCallback: (() => void) | undefined
+
+	private get isMovementCallbackPending() {
+		return this._cancelMovementCallback != undefined
+	}
+
+	/**
+	 * Cancel the currently queued movement callback, if there is one. This is
+	 *   a no-op if there is no queued callback
+	 */
+	private cancelMovementCallback() {
+		if (this._cancelMovementCallback != undefined) {
+			this.log("Cancelling pending callback")
+			this._cancelMovementCallback()
+			this._cancelMovementCallback = undefined
+		}
+	}
+
+	/**
+	 * Queue a new movement callback, cancelling any other pending one.
+	 */
+	private queueMovementCallback() {
+		this.log("Queueing movement callback")
+
+		this.cancelMovementCallback()
+		this._cancelMovementCallback = delay(() => {
+			this.log("Movement callback called")
+			this.storedState = this.getCalculatedState()
+			this._cancelMovementCallback = undefined
+		}, this.config.durationOfMovement)
+	}
+
+	/**
+	 * A buffer that will iron out any noise in the sensor readings. We will
+	 *   only process sensor readings when they are at least 75% of the last
+	 *   four readings.
+	 */
+	private calculatedStateBuffer = makeBuffer<CalculatedState>()
 
 	/**
 	 * This constructs an instance of our accessory, setting up all of the
@@ -207,55 +246,51 @@ export class GaragePi {
 		this.doorTargetState
 			.on("get", (callback) => callback(null, this.storedTargetState))
 			.on("set", (state, callback) => {
-				this.log(`Request state "${DoorState[state]}"`)
-				this.setQueue.push([state, callback])
+				this.queueRequest(state, callback)
 
 				return true
 			})
 
-		this.startPolling()
+		this.poll()
 	}
 
-	private clearMovement() {
-		if (this.cancelMovementCompleteCallback != undefined) {
-			this.log("Cancelling pending callback")
-			this.cancelMovementCompleteCallback()
-			this.cancelMovementCompleteCallback = undefined
+	private async queueRequest(state: TargetState, callback: () => void) {
+		this.requestQueue.push([state, callback])
+		this.log(`A new request for "${DoorState[state]}" was queued`)
+
+		if (this.requestQueue.length === 1) {
+			// This will start processing active requests if this is the first
+			//   request since the queue was last emptied.
+			this.processRequests()
 		}
 	}
 
-	private queueMovement() {
-		this.log("Queueing movement callback")
-		this.cancelMovementCompleteCallback = delay(() => {
-			this.log("Movement callback called")
-			this.storedState = this.getCalculatedState()
-			this.cancelMovementCompleteCallback = undefined
-		}, this.config.durationOfMovement)
-	}
+	processingRequests = false
 
-	/**
-	 * A buffer that will iron out any noise in the sensor readings. We will
-	 *   only process sensor readings when they are at least 75% of the last
-	 *   four readings.
-	 */
-	calculatedStateBuffer = makeBuffer<CalculatedState>()
+	private async processRequests() {
+		while (this.processingRequests = this.requestQueue.length > 0) {
+			const [target, done] = this.requestQueue[0]
 
-	async startPolling() {
-		// First check if there is any pending set calls
-		const set = this.setQueue.shift()
+			this.log(`Process request for "${DoorState[target]}"`)
 
-		// If there is a pending set call, process it this iteration
-		if (set != undefined) {
-			// Unwrap the current set request from the queue
-			const [targetState, done] = set
+			// If the target state is already the same as the stored state, or
+			//   the target state will be reached if the door keeps moving as we
+			//   currently think it is.
+			if (target === DoorState.closed &&
+					[DoorState.closed, DoorState.closing]
+						.indexOf(this.storedState) >= 0 ||
+					target === DoorState.open &&
+					[DoorState.open, DoorState.opening]
+						.indexOf(this.storedState) >= 0) {
+				this.log(`State is already "${DoorState[this.storedState]}". Skipping.`)
 
-			// If the target state is already the same as the stored state
-			if (targetState === this.storedState) {
 				// Call the done callback
 				done()
 			} else {
-				// If there was already a pending callback, cancel it!
-				this.clearMovement()
+				// The state is different from stored! Let's push the button!
+
+				// If there is a pending movement callback, cancel it first
+				this.cancelMovementCallback()
 
 				// Press the button to get the door moving!
 				this.log("Pressing button")
@@ -263,7 +298,7 @@ export class GaragePi {
 
 				// Calculate the next state based on the stored current state
 				//   and the standard garage movements
-				let newState = (() => {
+				const newState = (() => {
 					switch (this.storedState) {
 						case DoorState.open:
 							return DoorState.closing
@@ -278,10 +313,12 @@ export class GaragePi {
 					}
 				})()
 
+				this.log(`Last state was "${DoorState[this.storedState]}" and predicted state is "${DoorState[newState]}"`)
+
 				let needToWaitForInitialMovement = false
 
-				if (this.storedState === DoorState.closed ||
-					this.storedState === DoorState.open) {
+				if ([DoorState.closed, DoorState.open]
+						.indexOf(this.storedState) >= 0) {
 					needToWaitForInitialMovement = true
 				}
 
@@ -296,84 +333,89 @@ export class GaragePi {
 				// If the door didn't transition to stopped, we need to wait for
 				//   movement to end.
 				if (newState !== DoorState.stopped) {
-					this.queueMovement()
+					this.queueMovementCallback()
 				}
+
 
 				if (needToWaitForInitialMovement) {
 					this.waitingForInitialMovement = true
 
+					// It sometimes takes a few seconds for the door to start
+					//   moving. Wait for that here.
 					delay(() => {
 						this.waitingForInitialMovement = false
 					}, this.config.durationOfMovement / 5)
 				}
 			}
-		} else if (!this.waitingForInitialMovement) {
-			// We enter here if there isn't a pending set request and we aren't
-			//   currently waiting for the door to start moving after pressing
-			//   the button
 
+			this.requestQueue.shift()
+		}
+	}
+
+	async poll() {
+		// We enter the calculation step only if we aren't currently processing
+		//   a set request or waiting for the door to start moving after
+		//   pressing the button.
+		if (!this.processingRequests && !this.waitingForInitialMovement) {
+			/**
+			 * Calculate the state based on the sensors that we have. This is
+			 *   basically whether the door is all the way open, all the way
+			 *   closed, or neither.
+			 */
 			const calculatedState = this.getCalculatedState()
 
-			// this.log(`Calculated state is "${DoorState[calculatedState]}"`)
-
-			// Add the newest value to the beginning of the array. We'll trim
-			//  from the end later.
+			// Add the newest value to the buffer
 			this.calculatedStateBuffer.push(calculatedState)
 
-			// Only process the state if the buffer has had time to populate.
-			//   Otherwise, let's just keep moving.
-			if (this.calculatedStateBuffer.populated) {
-				// Only process the current calculated state if half or more of
-				//   the states in the buffer equal the calculated state
-				if (this.calculatedStateBuffer.filter((state) => state === calculatedState).length >= 0.75 * this.calculatedStateBuffer.length) {
-					// If the calculated state doesn't match the stored state, then we
-					//   need to determine what the actual new state should be
-					if (calculatedState !== this.storedState) {
-						// It now it is either open or closed (and wasn't before,
-						//   because at this point we know that it is different than the
-						//   previous state)
-						if (calculatedState !== DoorState.stopped) {
-							// Clear any pending movement callback, if it hasn't been
-							//   triggered yet. The door reached the end so we don't
-							//   need to wait for it to move any more
-							this.clearMovement()
+			// Only process the current calculated state if the predict of the
+			//   buffer equals the calculated state. This ensures that noise is
+			//   properly filtered out. We also only move forward if the stored
+			//   state is different from the calculated state
+			if (this.calculatedStateBuffer.predict === calculatedState &&
+					calculatedState !== this.storedState) {
+				// It now it is either open or closed (and wasn't before,
+				//   because at this point we know that it is different than the
+				//   previous state)
+				if (calculatedState !== DoorState.stopped) {
+					// Clear any pending movement callback, if it hasn't been
+					//   triggered yet. The door reached the end so we don't
+					//   need to wait for it to move any more
+					this.cancelMovementCallback()
 
-							this.log(`State updated in poll`)
-							this.storedState = calculatedState
-						} else if (this.cancelMovementCompleteCallback == undefined) {
-							// There is currently no movement callback active
+					this.log(`State updated in poll because the door was calculated as`)
+					this.log(`  ${DoorState[calculatedState]} and we weren't processing requests or waiting`)
+					this.log(`  for an initial movement.`)
+					this.storedState = calculatedState
+				} else if (!this.isMovementCallbackPending) {
+					// There is currently no movement callback active, but the
+					//   door still changed from our last calculated state. We
+					//   now update the state accordingly. If the door was
+					//   previously open, it is now closing. If it was
+					//   previously closed, it's now opening. Anything else, we
+					//   just update it to the calculated value. In addition, if
+					//   it was previously open or closed, we assume someone
+					//   pressed the physical button and we should queue a
+					//   movement callback that will update the state after the
+					//   movement finishes.
 
-							// We are updating the state to what it should be next. If
-							//   the door was previously open, it is now closing. If it
-							//   was previously closed, it's now opening. Anything else,
-							//   we just update it to the calculated value. In addition,
-							//   if it was previously open or closed, we assume someone
-							//   pressed the physical button and we should queue a
-							//   movement callback that will update the state after the
-							//   movement finishes
-							this.log(`State updated in poll`)
-							this.storedState = (() => {
-								switch (this.storedState) {
-								case DoorState.closed:
-									this.queueMovement()
+					this.log(`State updated in poll because there was no movement`)
+					this.log(`  callback pending and the state wasn't what we expected.`)
+					if ([DoorState.closed, DoorState.open]
+							.indexOf(this.storedState) >= 0) {
+						this.queueMovementCallback()
 
-									return DoorState.opening
-								case DoorState.open:
-									this.queueMovement()
-
-									return DoorState.closing
-								default:
-									return calculatedState
-								}
-							})()
-						}
+						this.storedState = this.storedState === DoorState.closed ?
+							DoorState.opening :
+							DoorState.closing
+					} else {
+						this.storedState = calculatedState
 					}
 				}
 			}
 		}
 
 		// Queue up the next poll iteration
-		setTimeout(() => this.startPolling(), this.config.pollingInterval)
+		setTimeout(() => this.poll(), this.config.pollingInterval)
 	}
 
 	/**
@@ -465,26 +507,26 @@ function delay(block: () => void, millis: number = 0): () => void {
 }
 
 function makeBuffer<T>(length: number = 4) {
-	interface Buffer<T> extends Array<T> {
-		populated: boolean
+	interface Buffer extends Array<T> {
+		readonly predict: T | undefined
 	}
 
-	const buffer = new Proxy([], {
+	const buffer = new Proxy([] as T[], {
 		get(target, prop) {
 			if (prop === "unshift") {
 				return function() {
 					target.unshift.apply(target, arguments)
 
-					if (target.length > 4) {
-						target.length = 4
+					if (target.length > length) {
+						target.length = length
 					}
 				}
 			} else if (prop === "push") {
 				return function() {
 					target.push.apply(target, arguments)
 
-					if (target.length > 4) {
-						target.splice(0, target.length - 4)
+					if (target.length > length) {
+						target.splice(0, target.length - length)
 					}
 				}
 			} else {
@@ -493,11 +535,30 @@ function makeBuffer<T>(length: number = 4) {
 		}
 	}) as any
 
-	Object.defineProperty(buffer, "populated", {
-		get(this: Buffer<T>) {
-			return this.length >= length
+	Object.defineProperties(buffer, {
+		predict: {
+			get(this: Buffer) {
+				const predict = this.reduce((trans, next) => {
+					const index = trans.findIndex((item) => item[0] === next)
+
+					if (index >= 0) {
+						trans[index][1] += 1
+					} else {
+						trans.push([next, 1])
+					}
+
+					return trans
+				}, [] as [T, number][])
+				.reduce((trans, next) => next[1] > trans[1] ? next : trans)
+
+				if (predict[1] >= 0.75 * this.length) {
+					return predict[0]
+				}
+
+				return undefined
+			}
 		}
 	})
 
-	return buffer as Buffer<T>
+	return buffer as Buffer
 }
