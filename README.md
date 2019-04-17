@@ -18,7 +18,7 @@ I developed my custom accessory for `homebridge` using `typescript`, as opposed 
 
 #### How to build
 
-To build the dist archive, `cd` to the `homebridge-garage-pi` directory and run `npm run build`. That will package all the compiled code and the `package.json` into `dist.zip`. Unzip the archive on the target device and run `npm i --prod` there to install the required production dependencies.
+To build the dist archive, `cd` to the `homebridge-garage-pi` directory and run `npm run build`. That will package all the compiled code and the `package.json` into `dist.zip`.
 
 ### How to run
 
@@ -26,10 +26,10 @@ To run this project on your own, you need to:
 
 1. Install `homebridge` on your raspberry pi
 2. Copy the files to the appropriate directories
-	* `homebridge.service` -> `/etc/systemd/system/`
-	* `homebridge` -> `/etc/default/`
-	* `homebridge-garage-pi/dist.zip` => `/etc/lib/homebridge/custom-accessories/homebridge-garage-pi/`
-	* `config.json` -> `/var/lib/homebridge/`
+	* Copy `homebridge.service` to `/etc/systemd/system/`
+	* Copy `homebridge` to `/etc/default/`
+	* Copy `homebridge-garage-pi/dist.zip` to `/var/lib/homebridge/custom-accessories/homebridge-garage-pi/` and extract it and run `npm i --prod` there. You can then delete `dist.zip`.
+	* Copy `config.json` to `/var/lib/homebridge/`
 3. Enable the `homebridge` service using `systemctl`
 4. Optionally see the `homebridge` logs with `journalctl`
 

@@ -7,7 +7,7 @@
 	"description": "This is the plugin code for my embedded systems project – a raspberry pi garage door opener from scratch.",
 	"main": "build/index.js",
 	"scripts": {
-		"prebuild": "rimraf dist.zip build",
+		"prebuild": "rm -rf dist.zip build",
 		"build": "tsc",
 		"postbuild": "zip -r dist build package*"
 	},
@@ -16,8 +16,8 @@
 	},
 	"devDependencies": {
 		"@types/rpio": "0.0.2",
-		"rimraf": "^2.6.2",
-		"typescript": "^2.8.1",
+		"typescript": "^3.4.3",
+		"tslint": "^5.16.0",
 		"zip": "^1.2.0"
 	},
 	"engines": {

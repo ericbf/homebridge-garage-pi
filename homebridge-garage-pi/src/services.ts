@@ -1,39 +1,34 @@
 import { GaragePi } from "./garage-pi"
 
 export let Service: {
-	GarageDoorOpener: {
-		new(name: string, subtype: string): Has<ItemCharacteristic>
-	}
-
-	AccessoryInformation: {
-		new(): Has<AccesorryCharacteristic>
-	}
+	AccessoryInformation: new() => Has<AccesorryCharacteristic>
+	GarageDoorOpener: new(name: string, subtype: string) => Has<ItemCharacteristic>
 }
 
-interface Has<T> {
+export interface Has<T> {
 	getCharacteristic<U>(characteristic: T): MutableCharacteristic<U>
 	setCharacteristic<U>(characteristic: T, value: U): Has<T>
 }
 
 export interface MutableCharacteristic<T> {
-	on(action: 'get', callback: (callback: (error: any, value: T) => void) => void): MutableCharacteristic<T>
-	on(action: 'set', callback: (value: T, callback: () => void) => void): MutableCharacteristic<T>
-	updateValue(value: T): void
+	value: T
 
 	getValue(): T
-	value: T
+	on(action: `get`, callback: (callback: (error: Error | undefined, value: T) => void) => void): MutableCharacteristic<T>
+	on(action: `set`, callback: (value: T, callback: () => void) => void): MutableCharacteristic<T>
+	updateValue(value: T): void
 }
 
 export let Characteristic: CombinedCharacteristics
 
-enum AccesorryCharacteristic {
+export enum AccesorryCharacteristic {
 	// Inherited Characteristics
 	Manufacturer,
 	Model,
 	SerialNumber
 }
 
-enum ItemCharacteristic {
+export enum ItemCharacteristic {
 	// Required Characteristics
 	CurrentDoorState,
 	TargetDoorState,
@@ -47,9 +42,18 @@ enum ItemCharacteristic {
 
 type CombinedCharacteristics = typeof AccesorryCharacteristic & typeof ItemCharacteristic
 
-export const Plugin = (homebridge: any) => {
+interface Homebridge {
+	hap: {
+		Characteristic: typeof Characteristic
+		Service: typeof Service
+	}
+
+	registerAccessory<T>(key: string, name: string, type: T): void
+}
+
+export const Plugin = (homebridge: Homebridge) => {
 	Service = homebridge.hap.Service
 	Characteristic = homebridge.hap.Characteristic
 
-	homebridge.registerAccessory("homebridge-garage-pi", "GaragePi", GaragePi)
+	homebridge.registerAccessory(`homebridge-garage-pi`, `GaragePi`, GaragePi)
 }

@@ -1,6 +1,6 @@
-import { open, write, read, HIGH, LOW, PULL_DOWN, INPUT, OUTPUT } from "rpio"
-import { Service, Characteristic, MutableCharacteristic } from "./services"
+import { HIGH, INPUT, LOW, open, OUTPUT, PULL_DOWN, read, write } from "rpio"
 import { Config } from "./config"
+import { AccesorryCharacteristic, Characteristic, Has, ItemCharacteristic, MutableCharacteristic, Service } from "./services"
 
 // https://github.com/KhaosT/HAP-NodeJS/blob/1f1fea7a995f09671d5e0aba50e965c1f4729f4d/lib/gen/HomeKitTypes.js#L476
 /**
@@ -16,7 +16,7 @@ enum DoorState {
 
 // https://github.com/KhaosT/HAP-NodeJS/blob/1f1fea7a995f09671d5e0aba50e965c1f4729f4d/lib/gen/HomeKitTypes.js#L2268
 /**
- * The states that can possibly be set as the target state.
+ * The states that can possibly be set as the target state.
  */
 type TargetState = DoorState.open | DoorState.closed
 
@@ -29,38 +29,9 @@ type CalculatedState = DoorState.open | DoorState.closed | DoorState.stopped
  * This is the entity that encapsulates the garage door opening and pi logic.
  */
 export class GaragePi {
-	/**
-	 * The default value for the polling interval. Defaults to `250`.
-	 */
-	static readonly DEFAULT_POLLING_INTERVAL = 250
-
-	/**
-	 * The default value for the duration to press the garage button. Defaults
-	 *   to `300`.
-	 */
-	static readonly DEFAULT_DURATION_TO_PRESS_BUTTON = 300
-
-	/**
-	 * This is the services that will be used by Homebridge service to
-	 *   understand and communicate with our accesory
-	 */
-	services: any[]
-
-	/**
-	 * This is the homebridge characteristic for the current door state
-	 */
-	doorState: MutableCharacteristic<DoorState>
-
-	/**
-	 * This is the homebridge characteristic for the target door state
-	 */
-	doorTargetState: MutableCharacteristic<TargetState>
-
-	/**
-	 * This is the backing store for the `storedState` variable. Please don't
-	 *   access this directly.
-	 */
-	private _storedState: DoorState = undefined as any
+	private get isMovementCallbackPending() {
+		return this._cancelMovementCallback != undefined
+	}
 
 	/**
 	 * This is the door's state, as far as we know. Update this when we know it
@@ -80,19 +51,10 @@ export class GaragePi {
 
 		this.log(`Updated state to "${DoorState[newValue]}"`)
 
-		if (newValue === DoorState.closed ||
-			newValue === DoorState.closing) {
-			this.storedTargetState = DoorState.closed
-		} else {
-			this.storedTargetState = DoorState.open
-		}
+		this.storedTargetState = newValue === DoorState.closed || newValue === DoorState.closing
+			? DoorState.closed
+			: this.storedTargetState = DoorState.open
 	}
-
-	/**
-	 * This is the backing store for the `_targetStoredState` variable. Please
-	 *   don't access this directly.
-	 */
-	private _storedTargetState: TargetState = undefined as any
 
 	/**
 	 * This is the target state that we have stored for future reference.
@@ -115,18 +77,32 @@ export class GaragePi {
 	}
 
 	/**
-	 * After we programatically press the button, let's wait a few seconds for
-	 *   the door to actually physically react. This will ensure we don't run
-	 *   into a race condition where the door registers as still open/closed
-	 *   because it hasn't started moving yet
+	 * The default value for the duration to press the garage button. Defaults
+	 *   to `300`.
 	 */
-	private waitingForInitialMovement = false
+	static readonly DEFAULT_DURATION_TO_PRESS_BUTTON = 300
+	/**
+	 * The default value for the polling interval. Defaults to `250`.
+	 */
+	static readonly DEFAULT_POLLING_INTERVAL = 250
 
 	/**
-	 * A queue of the set requests. This prevents button mashing from tripping
-	 *   the system up.
+	 * This is the homebridge characteristic for the current door state
 	 */
-	private requestQueue: [TargetState, () => void][] = []
+	doorState: MutableCharacteristic<DoorState>
+
+	/**
+	 * This is the homebridge characteristic for the target door state
+	 */
+	doorTargetState: MutableCharacteristic<TargetState>
+
+	processingRequests = false
+
+	/**
+	 * This is the services that will be used by Homebridge service to
+	 *   understand and communicate with our accesory
+	 */
+	services: [Has<AccesorryCharacteristic>, Has<ItemCharacteristic>]
 
 	/**
 	 * This will either be a cancel function for the last wait, or undefined if
@@ -135,42 +111,38 @@ export class GaragePi {
 	 */
 	private _cancelMovementCallback: (() => void) | undefined
 
-	private get isMovementCallbackPending() {
-		return this._cancelMovementCallback != undefined
-	}
+	/**
+	 * This is the backing store for the `storedState` variable. Please don't
+	 *   access this directly.
+	 */
+	private _storedState!: DoorState
 
 	/**
-	 * Cancel the currently queued movement callback, if there is one. This is
-	 *   a no-op if there is no queued callback
+	 * This is the backing store for the `_targetStoredState` variable. Please
+	 *   don't access this directly.
 	 */
-	private cancelMovementCallback() {
-		if (this._cancelMovementCallback != undefined) {
-			this.log("Cancelling pending callback")
-			this._cancelMovementCallback()
-			this._cancelMovementCallback = undefined
-		}
-	}
-
-	/**
-	 * Queue a new movement callback, cancelling any other pending one.
-	 */
-	private queueMovementCallback() {
-		this.log("Queueing movement callback")
-
-		this.cancelMovementCallback()
-		this._cancelMovementCallback = delay(() => {
-			this.log("Movement callback called")
-			this.storedState = this.getCalculatedState()
-			this._cancelMovementCallback = undefined
-		}, this.config.durationOfMovement)
-	}
+	private _storedTargetState!: TargetState
 
 	/**
 	 * A buffer that will iron out any noise in the sensor readings. We will
 	 *   only process sensor readings when they are at least 75% of the last
 	 *   four readings.
 	 */
-	private calculatedStateBuffer = makeBuffer<CalculatedState>()
+	private readonly calculatedStateBuffer = makeBuffer<CalculatedState>()
+
+	/**
+	 * A queue of the set requests. This prevents button mashing from tripping
+	 *   the system up.
+	 */
+	private readonly requestQueue: TargetState[] = []
+
+	/**
+	 * After we programatically press the button, let's wait a few seconds for
+	 *   the door to actually physically react. This will ensure we don't run
+	 *   into a race condition where the door registers as still open/closed
+	 *   because it hasn't started moving yet
+	 */
+	private waitingForInitialMovement = false
 
 	/**
 	 * This constructs an instance of our accessory, setting up all of the
@@ -183,19 +155,20 @@ export class GaragePi {
 	 * 				   will be populated with defaults, if there is one for that
 	 * 				   option.
 	 */
-	constructor(public log: (message: any) => void, public config: Config) {
+	constructor(public log: <T>(message: T) => void, public config: Config) {
 		// Fill in the defaults for whatever of the optional values are missing
-		this.config = Object.assign({
+		this.config = {
 			pollingInterval: GaragePi.DEFAULT_POLLING_INTERVAL,
-			durationToPressButton: GaragePi.DEFAULT_DURATION_TO_PRESS_BUTTON
-		}, this.config)
+			durationToPressButton: GaragePi.DEFAULT_DURATION_TO_PRESS_BUTTON,
+			...this.config
+		}
 
 		const requiredOptions = [
-			"name",
-			"buttonPin",
-			"openSensorPin",
-			"closedSensorPin",
-			"durationOfMovement"
+			`name`,
+			`buttonPin`,
+			`openSensorPin`,
+			`closedSensorPin`,
+			`durationOfMovement`
 		]
 
 		const definedOptions = Object.keys(this.config)
@@ -234,122 +207,68 @@ export class GaragePi {
 		this.services = [infoService, doorService]
 
 		infoService
-			.setCharacteristic(Characteristic.Manufacturer, "Eric Ferreira")
-			.setCharacteristic(Characteristic.Model, "Garage Pi Opener")
-			.setCharacteristic(Characteristic.SerialNumber, "000-000-001")
+			.setCharacteristic(Characteristic.Manufacturer, `Eric Ferreira`)
+			.setCharacteristic(Characteristic.Model, `Garage Pi Opener`)
+			.setCharacteristic(Characteristic.SerialNumber, `000-000-001`)
 
 		this.doorState = doorService.getCharacteristic(Characteristic.CurrentDoorState)
 		this.doorTargetState = doorService.getCharacteristic<TargetState>(Characteristic.TargetDoorState)
 
-		this.doorState.on("get", (callback) => callback(null, this.storedState))
+		this.doorState.on(`get`, (callback) => callback(undefined, this.storedState))
 
 		this.doorTargetState
-			.on("get", (callback) => callback(null, this.storedTargetState))
-			.on("set", (state, callback) => {
-				this.queueRequest(state, callback)
+			.on(`get`, (callback) => callback(undefined, this.storedTargetState))
+			.on(`set`, (state, callback) => {
+				callback()
+
+				delay(() => this.queueRequest(state))
 
 				return true
 			})
 
-		this.poll()
+		this.poll().catch()
 	}
 
-	private async queueRequest(state: TargetState, callback: () => void) {
-		this.requestQueue.push([state, callback])
-		this.log(`A new request for "${DoorState[state]}" was queued`)
+	/**
+	 * Get the plain and simple calculated current state based on the available
+	 *   sensors. We can really only know whether the door is open, closed, or
+	 *   somewhere in between. If it is somewhere in between, we just report it
+	 *   as stopped.
+	 */
+	getCalculatedState() {
+		/**
+		 * This is if the value of the open sensor is true. The door is all the
+		 *   way open. If false, it's either partially open or closed.
+		 */
+		const isOpen = read(this.config.openSensorPin) === HIGH
 
-		if (this.requestQueue.length === 1) {
-			// This will start processing active requests if this is the first
-			//   request since the queue was last emptied.
-			this.processRequests()
+		/**
+		 * This is if the value of the closed sensor is true. The door is all
+		 *   the way closed. If false, it's open either partially or all the
+		 *   way.
+		 */
+		const isClosed = read(this.config.closedSensorPin) === HIGH
+
+		// If both sensors read as true, something really funky is going on
+		if (isOpen && isClosed) {
+			this.log(`Both sensors read as true. Error state!`)
 		}
+
+		// this.log(`Sensor states are (Open: ${isOpen}) and (Closed: ${isClosed})`)
+
+		return isOpen ?
+			DoorState.open :
+			isClosed ?
+				DoorState.closed :
+				DoorState.stopped
 	}
 
-	processingRequests = false
-
-	private async processRequests() {
-		while (this.processingRequests = this.requestQueue.length > 0) {
-			const [target, done] = this.requestQueue[0]
-
-			this.log(`Process request for "${DoorState[target]}"`)
-
-			// If the target state is already the same as the stored state, or
-			//   the target state will be reached if the door keeps moving as we
-			//   currently think it is.
-			if (target === DoorState.closed &&
-					[DoorState.closed, DoorState.closing]
-						.indexOf(this.storedState) >= 0 ||
-					target === DoorState.open &&
-					[DoorState.open, DoorState.opening]
-						.indexOf(this.storedState) >= 0) {
-				this.log(`State is already "${DoorState[this.storedState]}". Skipping.`)
-
-				// Call the done callback
-				done()
-			} else {
-				// The state is different from stored! Let's push the button!
-
-				// If there is a pending movement callback, cancel it first
-				this.cancelMovementCallback()
-
-				// Press the button to get the door moving!
-				this.log("Pressing button")
-				const buttonPress = this.pressButton()
-
-				// Calculate the next state based on the stored current state
-				//   and the standard garage movements
-				const newState = (() => {
-					switch (this.storedState) {
-						case DoorState.open:
-							return DoorState.closing
-						case DoorState.closed:
-							return DoorState.opening
-						case DoorState.opening:
-							return DoorState.stopped
-						case DoorState.closing:
-							return DoorState.opening
-						case DoorState.stopped:
-							return DoorState.closing
-					}
-				})()
-
-				this.log(`Last state was "${DoorState[this.storedState]}" and predicted state is "${DoorState[newState]}"`)
-
-				let needToWaitForInitialMovement = false
-
-				if ([DoorState.closed, DoorState.open]
-						.indexOf(this.storedState) >= 0) {
-					needToWaitForInitialMovement = true
-				}
-
-				this.storedState = newState
-
-				// Call the callback to let homebridge know the set was successful
-				done()
-
-				await buttonPress
-				this.log("Done pressing button")
-
-				// If the door didn't transition to stopped, we need to wait for
-				//   movement to end.
-				if (newState !== DoorState.stopped) {
-					this.queueMovementCallback()
-				}
-
-
-				if (needToWaitForInitialMovement) {
-					this.waitingForInitialMovement = true
-
-					// It sometimes takes a few seconds for the door to start
-					//   moving. Wait for that here.
-					delay(() => {
-						this.waitingForInitialMovement = false
-					}, this.config.durationOfMovement / 5)
-				}
-			}
-
-			this.requestQueue.shift()
-		}
+	/**
+	 * This function is required by Homebridge and returns the services that
+	 *   define this plugin.
+	 */
+	getServices() {
+		return this.services
 	}
 
 	async poll() {
@@ -419,40 +338,6 @@ export class GaragePi {
 	}
 
 	/**
-	 * Get the plain and simple calculated current state based on the available
-	 *   sensors. We can really only know whether the door is open, closed, or
-	 *   somewhere in between. If it is somewhere in between, we just report it
-	 *   as stopped.
-	 */
-	getCalculatedState() {
-		/**
-		 * This is if the value of the open sensor is true. The door is all the
-		 *   way open. If false, it's either partially open or closed.
-		 */
-		const isOpen = read(this.config.openSensorPin) === HIGH
-
-		/**
-		 * This is if the value of the closed sensor is true. The door is all
-		 *   the way closed. If false, it's open either partially or all the
-		 *   way.
-		 */
-		const isClosed = read(this.config.closedSensorPin) === HIGH
-
-		// If both sensors read as true, something really funky is going on
-		if (isOpen && isClosed) {
-			this.log("Both sensors read as true. Error state!")
-		}
-
-		// this.log(`Sensor states are (Open: ${isOpen}) and (Closed: ${isClosed})`)
-
-		return isOpen ?
-			DoorState.open :
-			isClosed ?
-				DoorState.closed :
-				DoorState.stopped
-	}
-
-	/**
 	 * This function presses the garage door button for the specified duration.
 	 *
 	 * This is the garage behavior on button press:
@@ -477,11 +362,123 @@ export class GaragePi {
 	}
 
 	/**
-	 * This function is required by Homebridge and returns the services that
-	 *   define this plugin.
+	 * Cancel the currently queued movement callback, if there is one. This is
+	 *   a no-op if there is no queued callback
 	 */
-	getServices() {
-		return this.services
+	private cancelMovementCallback() {
+		if (this._cancelMovementCallback != undefined) {
+			this.log(`Cancelling pending callback`)
+			this._cancelMovementCallback()
+			this._cancelMovementCallback = undefined
+		}
+	}
+
+	private async processRequests() {
+		this.processingRequests = this.requestQueue.length > 0
+
+		while (this.processingRequests) {
+			const target = this.requestQueue[0]
+
+			this.log(`Process request for "${DoorState[target]}"`)
+
+			// If the target state is already the same as the stored state, or
+			//   the target state will be reached if the door keeps moving as we
+			//   currently think it is.
+			if (target === DoorState.closed &&
+					[DoorState.closed, DoorState.closing]
+						.indexOf(this.storedState) >= 0 ||
+					target === DoorState.open &&
+					[DoorState.open, DoorState.opening]
+						.indexOf(this.storedState) >= 0) {
+				this.log(`State is already "${DoorState[this.storedState]}". Skipping.`)
+			} else {
+				// The state is different from stored! Let's push the button!
+
+				// If there is a pending movement callback, cancel it first
+				this.cancelMovementCallback()
+
+				// Press the button to get the door moving!
+				this.log(`Pressing button`)
+				const buttonPress = this.pressButton()
+
+				// Calculate the next state based on the stored current state
+				//   and the standard garage movements
+				const newState = (() => {
+					switch (this.storedState) {
+						case DoorState.open:
+							return DoorState.closing
+						case DoorState.closed:
+							return DoorState.opening
+						case DoorState.opening:
+							return DoorState.stopped
+						case DoorState.closing:
+							return DoorState.opening
+						case DoorState.stopped:
+							return DoorState.closing
+						default:
+							return this.storedState
+					}
+				})()
+
+				this.log(`Last state was "${DoorState[this.storedState]}" and predicted state is "${DoorState[newState]}"`)
+
+				let needToWaitForInitialMovement = false
+
+				if ([DoorState.closed, DoorState.open]
+						.indexOf(this.storedState) >= 0) {
+					needToWaitForInitialMovement = true
+				}
+
+				this.storedState = newState
+
+				await buttonPress
+				this.log(`Done pressing button`)
+
+				// If the door didn't transition to stopped, we need to wait for
+				//   movement to end.
+				if (newState !== DoorState.stopped) {
+					this.queueMovementCallback()
+				}
+
+				if (needToWaitForInitialMovement) {
+					this.waitingForInitialMovement = true
+
+					// It sometimes takes a few seconds for the door to start
+					//   moving. Wait for that here.
+					delay(() => {
+						this.waitingForInitialMovement = false
+					}, this.config.durationOfMovement / 5)
+				}
+			}
+
+			this.requestQueue.shift()
+			this.processingRequests = this.requestQueue.length > 0
+		}
+	}
+
+	/**
+	 * Queue a new movement callback, cancelling any other pending one.
+	 */
+	private queueMovementCallback() {
+		this.log(`Queueing movement callback`)
+
+		this.cancelMovementCallback()
+		this._cancelMovementCallback = delay(() => {
+			this.log(`Movement callback called`)
+			this.storedState = this.getCalculatedState()
+			this._cancelMovementCallback = undefined
+		}, this.config.durationOfMovement)
+	}
+
+	private async queueRequest(state: TargetState) {
+		this.requestQueue.push(state)
+		this.log(`A new request for "${DoorState[state]}" was queued`)
+
+		if (this.requestQueue.length === 1) {
+			// This will start processing active requests if this is the first
+			//   request since the queue was last emptied.
+			this.processRequests().catch()
+		}
 	}
 }
 
@@ -498,7 +495,7 @@ async function resolveIn(millis: number) {
  * Delay the execution of a block for a certain number of milliseconds. Returns
  *   a function that when called will cancel the pending execution.
  */
-function delay(block: () => void, millis: number = 0): () => void {
+function delay(block: () => void, millis = 0): () => void {
 	const timer = setTimeout(block, millis)
 
 	return () => {
@@ -506,34 +503,34 @@ function delay(block: () => void, millis: number = 0): () => void {
 	}
 }
 
-function makeBuffer<T>(length: number = 4) {
+function makeBuffer<T>(length = 4) {
 	interface Buffer extends Array<T> {
 		readonly predict: T | undefined
 	}
 
 	const buffer = new Proxy([] as T[], {
 		get(target, prop) {
-			if (prop === "unshift") {
+			if (prop === `unshift`) {
 				return function() {
-					target.unshift.apply(target, arguments)
+					target.unshift.call(target, ...arguments)
 
 					if (target.length > length) {
 						target.length = length
 					}
 				}
-			} else if (prop === "push") {
+			} else if (prop === `push`) {
 				return function() {
-					target.push.apply(target, arguments)
+					target.push.call(target, ...arguments)
 
 					if (target.length > length) {
 						target.splice(0, target.length - length)
 					}
 				}
 			} else {
-				return (target as any)[prop]
+				return target[prop as keyof typeof target]
 			}
 		}
-	}) as any
+	}) as Buffer
 
 	Object.defineProperties(buffer, {
 		predict: {
@@ -560,5 +557,5 @@ function makeBuffer<T>(length: number = 4) {
 		}
 	})
 
-	return buffer as Buffer
+	return buffer
 }
